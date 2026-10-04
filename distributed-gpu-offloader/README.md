@@ -185,7 +185,7 @@ rejection and bad job ids.
 ## Screenshots & demo
 
 Add your captures to `docs/screenshots/` (see the checklist there) and link them here:
-```html
+
 ## Screenshots
 
 <p align="center">
@@ -232,7 +232,7 @@ Add your captures to `docs/screenshots/` (see the checklist there) and link them
     alt="Benchmark and Performance"
   />
 </p>
-```
+
 
 
 
