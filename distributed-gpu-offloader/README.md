@@ -188,14 +188,16 @@ Add your captures to `docs/screenshots/` (see the checklist there) and link them
 
 ## Screenshots
 
+## Screenshots
+
 <p align="center">
-  <img
+  <img 
     src="https://github.com/user-attachments/assets/c882a4cf-0444-42b5-84f7-b19415f2c226"
     width="48%"
     height="300"
     alt="Application Interface"
   />
-  <img
+  <img 
     src="https://github.com/user-attachments/assets/6e523fb3-8111-4ee8-a601-5f32f9a78672"
     width="48%"
     height="300"
@@ -204,32 +206,17 @@ Add your captures to `docs/screenshots/` (see the checklist there) and link them
 </p>
 
 <p align="center">
-  <img
+  <img 
     src="https://github.com/user-attachments/assets/210d6297-ac55-4f14-8dca-1d94c7598c4d"
     width="48%"
     height="300"
     alt="GPU Processing Monitor"
   />
-  <img
+  <img 
     src="https://github.com/user-attachments/assets/12316eb0-f14a-4cfa-830e-bdfb55ffa2b7"
     width="48%"
     height="300"
     alt="Processing Result"
-  />
-</p>
-
-<p align="center">
-  <img
-    src="https://github.com/user-attachments/assets/abcd6ce3-544a-4862-ac81-cbaaa81a0c39"
-    width="48%"
-    height="300"
-    alt="Worker Status"
-  />
-  <img
-    src="https://github.com/user-attachments/assets/3fad4071-942e-4dfa-aabf-ec7fdfa062dc"
-    width="48%"
-    height="300"
-    alt="Benchmark and Performance"
   />
 </p>
 
