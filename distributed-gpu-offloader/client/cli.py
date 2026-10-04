@@ -1,12 +1,18 @@
-#!/usr/bin/env python3
-"""Headless command line client (same engine as the GUI).
-
-    python client/cli.py check     --host 192.168.1.1
-    python client/cli.py bandwidth --host 192.168.1.1
-    python client/cli.py transcode --host 192.168.1.1 input.mp4 --resolution 1080 --bitrate 8M --preset p5
-    python client/cli.py local     input.mp4 --resolution 1080 --bitrate 8M --preset p5
-    python client/cli.py torch     --host 192.168.1.1 --n 4096 --iters 100
 """
+client/cli.py
+-------------
+Headless command-line client (same code path as the GUI).
+
+Useful for servers without a display, for the benchmark harness and for
+smoke-testing the whole pipeline:
+
+    python -m client.cli ping  --host 127.0.0.1
+    python -m client.cli info  --host 127.0.0.1
+    python -m client.cli run   --host 127.0.0.1 --task video --input clip.mp4 \\
+                               --resolution 1280x720 --bitrate 4M
+    python -m client.cli bench --host 127.0.0.1
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -14,113 +20,170 @@ import json
 import os
 import sys
 import time
-from pathlib import Path
+from typing import List, Optional
 
-ROOT = Path(__file__).resolve().parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from client.local_render import render_local  # noqa: E402
-from client.net_client import JobFailed, OffloadClient, TransferError  # noqa: E402
-from common.ffmpeg_utils import CODECS, PRESETS, RESOLUTIONS  # noqa: E402
-from common.protocol import DEFAULT_PORT, DEFAULT_TOKEN, AuthError, Cancelled, RemoteError  # noqa: E402
+from common import config
+from client.api import LogEvent, OffloadClient, OffloadError, ProgressEvent
 
 
-def _bar(p: dict) -> None:
-    pct = p["overall"]
-    filled = int(pct / 100 * 30)
-    sys.stdout.write(f"\r[{'#' * filled}{'.' * (30 - filled)}] {pct:5.1f}%  {p['stage']:<11} {p.get('text', '')[:60]:<60}")
-    sys.stdout.flush()
-    if p["stage"] == "done":
-        sys.stdout.write("\n")
+def _print_log(event: LogEvent) -> None:
+    tag = {"warning": "WARN", "error": "ERROR"}.get(event.level, "INFO")
+    print(f"  [{tag}] {event.message}", flush=True)
 
 
-def _log(msg: str) -> None:
-    sys.stdout.write("\r" + " " * 110 + "\r" + msg + "\n")
-    sys.stdout.flush()
+def _print_progress(event: ProgressEvent) -> None:
+    bar_len = 32
+    filled = int(bar_len * event.percent / 100.0)
+    bar = "#" * filled + "-" * (bar_len - filled)
+    print(f"\r  [{bar}] {event.percent:6.2f}%  {event.stage:<10}", end="", flush=True)
+    if event.percent >= 100.0:
+        print()
 
 
-def _client(a) -> OffloadClient:
-    return OffloadClient(a.host, a.port, a.token, log=_log, on_progress=None if a.quiet else _bar)
+def _build_params(args: argparse.Namespace) -> dict:
+    if args.task == "video":
+        return {
+            "resolution": args.resolution,
+            "bitrate": args.bitrate,
+            "preset": args.preset,
+            "encoder": args.encoder,
+            "quality": args.quality,
+            "audio_bitrate": args.audio_bitrate,
+        }
+    if args.task == "tensor":
+        return {
+            "matrix_size": args.matrix_size,
+            "iterations": args.iterations,
+            "batch_size": args.batch_size,
+            "device": args.device,
+        }
+    return {"work_units": args.work_units}
 
 
-def _settings(a) -> dict:
-    return {"resolution": a.resolution, "bitrate": a.bitrate, "preset": a.preset, "codec": a.codec,
-            "engine": a.engine}
-
-
-def main(argv=None) -> int:
-    p = argparse.ArgumentParser(description="GPU offload client (CLI)")
-    sub = p.add_subparsers(dest="cmd", required=True)
-
-    def net(sp):
-        sp.add_argument("--host", default="192.168.1.1")
-        sp.add_argument("--port", type=int, default=DEFAULT_PORT)
-        sp.add_argument("--token", default=os.environ.get("OFFLOAD_TOKEN", DEFAULT_TOKEN))
-        sp.add_argument("--quiet", action="store_true", help="no progress bar")
-
-    def render_opts(sp):
-        sp.add_argument("--resolution", default="original", choices=RESOLUTIONS)
-        sp.add_argument("--bitrate", default="5M")
-        sp.add_argument("--preset", default="p4", choices=PRESETS)
-        sp.add_argument("--codec", default="h264", choices=CODECS)
-        sp.add_argument("--engine", default="auto", choices=["auto", "gpu", "cpu"])
-
-    sp = sub.add_parser("check", help="handshake + latency ping test"); net(sp)
-    sp.add_argument("--pings", type=int, default=10)
-    sp = sub.add_parser("bandwidth", help="TCP throughput test"); net(sp)
-    sp.add_argument("--mb", type=int, default=64)
-    sp = sub.add_parser("transcode", help="offload a video transcode to the GPU worker"); net(sp); render_opts(sp)
-    sp.add_argument("input"); sp.add_argument("-o", "--output")
-    sp = sub.add_parser("local", help="render locally (baseline)"); render_opts(sp)
-    sp.add_argument("input"); sp.add_argument("-o", "--output"); sp.add_argument("--quiet", action="store_true")
-    sp = sub.add_parser("torch", help="run a PyTorch CUDA matmul benchmark on the worker"); net(sp)
-    sp.add_argument("--n", type=int, default=4096); sp.add_argument("--iters", type=int, default=50)
-    sp.add_argument("--dtype", default="fp32", choices=["fp32", "fp16"])
-    a = p.parse_args(argv)
-
+def cmd_ping(args: argparse.Namespace) -> int:
+    client = OffloadClient(args.host, args.port, on_log=_print_log)
     try:
-        if a.cmd == "check":
-            r = _client(a).check_worker(a.pings)
-            if not r["reachable"]:
-                print(f"✖ worker NOT reachable: {r['error']}" + (f"\n  hint: {r['hint']}" if r["hint"] else ""))
-                return 1
-            s = r["server"]
-            print(f"✔ worker {s['server']} reachable at {a.host}:{a.port}")
-            print(f"  connect {r['connect_ms']} ms | RTT avg {r['rtt_avg_ms']} ms (min {r['rtt_min_ms']}, "
-                  f"max {r['rtt_max_ms']}, jitter {r['jitter_ms']})")
-            print(f"  NVENC: {s['nvenc']} | GPUs: {', '.join(g['name'] for g in s['gpus']) or 'none'} | "
-                  f"queue: {s['queue_length']} | free disk: {s['free_disk_gb']} GB")
-            if r["hint"]:
-                print(f"  ⚠ {r['hint']}")
-        elif a.cmd == "bandwidth":
-            r = _client(a).bandwidth_test(a.mb)
-            print(f"upload   : {r['upload_mbps']} Mbit/s\ndownload : {r['download_mbps']} Mbit/s")
-        elif a.cmd == "transcode":
-            r = _client(a).run_transcode(a.input, _settings(a), a.output)
-            print(json.dumps({k: (round(v, 3) if isinstance(v, float) else v) for k, v in r.items()
-                              if k not in ("server_resource", "client_resource")}, indent=2))
-        elif a.cmd == "local":
-            out = a.output or str(Path(a.input).with_suffix("")) + "_local.mp4"
-            t = time.perf_counter()
-            r = render_local(a.input, out, _settings(a), a.engine,
-                             None if a.quiet else (lambda pr: sys.stdout.write(
-                                 f"\r{pr['percent']:5.1f}%  {pr['fps']:.0f} fps  {pr['speed']:.2f}x   ")))
-            print(f"\n✔ local render ({r['engine']}) took {r['render_s']:.1f}s -> {out}")
-        elif a.cmd == "torch":
-            r = _client(a).run_torch({"n": a.n, "iters": a.iters, "dtype": a.dtype})
-            print(f"\n✔ {r['engine']}: {r['tflops']} TFLOPS in {r['render_s']}s")
+        client.connect(retries=args.retries)
+        stats = client.ping(samples=args.count)
+        print(f"RTT avg={stats['avg_ms']:.2f} ms  min={stats['min_ms']:.2f} ms  "
+              f"max={stats['max_ms']:.2f} ms  jitter={stats['jitter_ms']:.2f} ms  "
+              f"loss={stats['loss_pct']:.1f}%  samples={stats['samples']}/{stats['requested']}")
         return 0
-    except AuthError as exc:
-        print(f"\n✖ authentication failed: {exc}")
-    except (TransferError, JobFailed, RemoteError) as exc:
-        print(f"\n✖ {exc}")
-    except Cancelled:
-        print("\n✖ cancelled")
-    except KeyboardInterrupt:
-        print("\n✖ interrupted")
+    except OffloadError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        client.close()
+
+
+def cmd_info(args: argparse.Namespace) -> int:
+    client = OffloadClient(args.host, args.port, on_log=_print_log)
+    try:
+        info = client.connect(retries=args.retries)
+        client.ping(samples=3)
+        env = info.get("environment", {})
+        print(json.dumps({
+            "server_id": env.get("hostname"),
+            "session_id": info.get("session_id"),
+            "rtt_ms": round(client.rtt_ms, 2),
+            "supported_tasks": info.get("supported_tasks"),
+            "environment": env,
+        }, indent=2))
+        return 0
+    except OffloadError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        client.close()
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    client = OffloadClient(args.host, args.port, on_log=_print_log)
+    try:
+        client.connect(retries=args.retries)
+        client.ping()
+        t0 = time.perf_counter()
+        result = client.run_job(
+            args.task, args.input, params=_build_params(args),
+            output_name=args.output, wait_timeout=args.timeout,
+            on_progress=_print_progress, on_log=_print_log,
+        )
+        wall = time.perf_counter() - t0
+        print()
+        print("=" * 64)
+        print(f"  job id      : {result.job_id}")
+        print(f"  engine      : {result.result.get('engine')}")
+        print(f"  worker time : {result.duration_s:.2f} s")
+        print(f"  wall time   : {wall:.2f} s")
+        print(f"  upload      : {result.transfer_bytes} bytes in "
+              f"{result.transfer_seconds:.2f} s")
+        print(f"  output      : {result.output_path} "
+              f"({result.output_bytes} bytes, sha256 {result.output_sha256[:16]}...)")
+        print("=" * 64)
+        return 0
+    except OffloadError as exc:
+        print(f"\nERROR: {exc}", file=sys.stderr)
+        return 3
+    finally:
+        client.close()
+
+
+def cmd_bench(args: argparse.Namespace) -> int:
+    from benchmarks.run_benchmark import run_matrix  # local import keeps CLI light
+    rows = run_matrix(host=args.host, port=args.port, quick=not args.full)
+    print(json.dumps(rows, indent=2))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="client.cli",
+        description="CSC-334 Distributed Task Offloading - command line client")
+    parser.add_argument("--host", default=config.DEFAULT_HOST)
+    parser.add_argument("--port", type=int, default=config.DEFAULT_PORT)
+    parser.add_argument("--retries", type=int, default=config.MAX_SUBMIT_ATTEMPTS)
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    ping = sub.add_parser("ping", help="measure latency to the worker")
+    ping.add_argument("--count", type=int, default=5,
+                      help="number of PING probes (default 5)")
+    sub.add_parser("info", help="print worker capabilities as JSON")
+
+    run = sub.add_parser("run", help="submit and download a job")
+    run.add_argument("--task", default="video", choices=config.SUPPORTED_TASKS)
+    run.add_argument("--input", required=True, help="path to the input asset")
+    run.add_argument("--output", default=None, help="remote output filename")
+    run.add_argument("--timeout", type=float, default=1800.0)
+    run.add_argument("--resolution", default="1280x720", choices=list(config.RESOLUTIONS))
+    run.add_argument("--bitrate", default="4M")
+    run.add_argument("--preset", default="p4")
+    run.add_argument("--encoder", default="auto")
+    run.add_argument("--quality", type=int, default=23)
+    run.add_argument("--audio-bitrate", default="192k")
+    run.add_argument("--matrix-size", type=int, default=1024)
+    run.add_argument("--iterations", type=int, default=60)
+    run.add_argument("--batch-size", type=int, default=32)
+    run.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
+    run.add_argument("--work-units", type=int, default=0)
+
+    bench = sub.add_parser("bench", help="run the local-vs-remote benchmark matrix")
+    bench.add_argument("--full", action="store_true", help="run the full matrix")
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.command == "ping":
+        return cmd_ping(args)
+    if args.command == "info":
+        return cmd_info(args)
+    if args.command == "run":
+        return cmd_run(args)
+    if args.command == "bench":
+        return cmd_bench(args)
     return 1
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

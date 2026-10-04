@@ -1,600 +1,756 @@
-#!/usr/bin/env python3
-"""GPU worker daemon (server side).
-
-Run:   python server/daemon.py --host 0.0.0.0 --port 5050 --token <secret>
-
-Design
-------
-* One thread per TCP connection (control + file transfer), a FIFO job queue and
-  N worker threads that run jobs on the GPU (default N=1).
-* Jobs are identified by a client generated id and are *independent of the TCP
-  connection*: if the socket dies the job keeps running, and the client can
-  reconnect and WATCH (progress replay), resume an interrupted upload, or
-  resume an interrupted download.
-* Integrity: SHA-256 is verified for the upload (server side) and for the
-  rendered result (client side).
-* Security: HMAC-SHA256 challenge/response with a shared token, strict
-  whitelist of render parameters, no shell is ever invoked with user data.
 """
+server/daemon.py
+----------------
+Headless worker daemon for the Distributed Task Offloading system (Tasks 1, 2 & 4).
+
+Responsibilities
+----------------
+* Accept TCP connections and perform the HELLO / HELLO_ACK handshake with
+  protocol version negotiation and capability exchange (GPU, encoders, CUDA).
+* Serve latency probes (PING -> PONG) so the client can measure RTT before
+  submitting any job.
+* Validate and receive input files with SHA-256 integrity checks.
+* Queue accepted jobs and execute them on a bounded worker pool (the
+  "Task Queue Manager" from the architecture diagram).
+* Stream asynchronous PROGRESS / LOG / HEARTBEAT events back to the owning
+  client while the job runs.
+* Stream the rendered artefact back with a SHA-256 integrity check.
+
+Run with::
+
+    python -m server.daemon --host 0.0.0.0 --port 5000 --workers 2
+"""
+
 from __future__ import annotations
 
 import argparse
 import logging
-import logging.handlers
 import os
 import queue
-import re
-import shutil
-import signal
 import socket
-import sys
 import threading
 import time
-from pathlib import Path
+import traceback
+import uuid
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
 
-ROOT = Path(__file__).resolve().parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from common.ffmpeg_utils import normalize_settings  # noqa: E402
-from common.protocol import (  # noqa: E402
-    DEFAULT_PORT, DEFAULT_TOKEN, PROTOCOL_VERSION, Cancelled, NullSink, ProtocolError,
-    make_nonce, recv_file_range, recv_json, send_data, send_error, send_file_range, send_json,
-    sha256_file, tune_socket, verify_auth,
+from common import config
+from common.protocol import (
+    PROTOCOL_VERSION,
+    MsgType,
+    ProtocolError,
+    recv_frame,
+    safe_filename,
+    send_frame,
+    set_socket_options,
+    sha256_file,
 )
-from common.util import human_bytes, local_ips  # noqa: E402
-from server.gpu_engine import EngineError, GpuEngine, normalize_torch_settings  # noqa: E402
+from server.environment import detect
+from server.executors import ExecutorError, get_executor
 
-log = logging.getLogger("gpu-worker")
-JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
-SHA_RE = re.compile(r"^[0-9a-f]{64}$")
-TERMINAL = ("done", "failed", "cancelled")
-IDLE_TIMEOUT = 30.0  # seconds without a byte from the client during a request
+log = logging.getLogger("server.daemon")
 
 
-# =========================================================================== jobs
+# --------------------------------------------------------------------------- #
+# Job model
+# --------------------------------------------------------------------------- #
+
+@dataclass
 class Job:
-    def __init__(self, job_id: str, kind: str, filename: str, size: int, sha256: str,
-                 settings: dict, root: Path):
-        self.id = job_id
-        self.kind = kind
-        self.filename = filename
-        self.size = size
-        self.sha256 = sha256
-        self.settings = settings
-        self.dir = root / job_id
-        self.dir.mkdir(parents=True, exist_ok=True)
-        ext = Path(filename).suffix.lower()
-        ext = ext if re.fullmatch(r"\.[a-z0-9]{1,6}", ext) else ".bin"
-        self.input_path = self.dir / f"input{ext}"
-        self.output_path = self.dir / "output.mp4"
-        self.state = "uploading" if kind == "transcode" else "created"
-        self.events: list[dict] = []
-        self.progress: dict = {}
-        self.version = 0
-        self.cond = threading.Condition()
-        self.cancel_event = threading.Event()
-        self.upload_lock = threading.Lock()
-        self.upload_conn: socket.socket | None = None
-        self.created = time.time()
-        self.enqueued_at: float | None = None
-        self.finished_at: float | None = None
-        self.result: dict = {}
-        self.error: str | None = None
+    job_id: str
+    task: str
+    params: dict
+    input_name: str
+    input_size: int
+    input_sha256: str
+    output_name: str
+    owner: "ClientSession"
+    state: str = "queued"            # queued | running | done | failed | cancelled
+    created_at: float = field(default_factory=time.time)
+    started_at: Optional[float] = None
+    finished_at: Optional[float] = None
+    percent: float = 0.0
+    stage: str = "queued"
+    result: Optional[dict] = None
+    error: Optional[str] = None
+    input_path: Optional[str] = None
+    output_path: Optional[str] = None
+    cancel_event: threading.Event = field(default_factory=threading.Event)
 
     @property
-    def terminal(self) -> bool:
-        return self.state in TERMINAL
-
-    def emit(self, kind: str, **data) -> None:
-        with self.cond:
-            self.events.append({"type": "EVENT", "seq": len(self.events), "kind": kind,
-                                "ts": round(time.time(), 3), **data})
-            self.version += 1
-            self.cond.notify_all()
-
-    def log(self, msg: str) -> None:
-        log.info("[%s] %s", self.id[:8], msg)
-        self.emit("log", message=msg)
-
-    def set_progress(self, **p) -> None:
-        with self.cond:
-            self.progress = p
-            self.version += 1
-            self.cond.notify_all()
-
-    def set_state(self, state: str, **extra) -> None:
-        with self.cond:
-            self.state = state
-            self.emit("state", state=state, **extra)
+    def elapsed(self) -> float:
+        start = self.started_at or self.created_at
+        end = self.finished_at or time.time()
+        return end - start
 
 
-class JobManager:
-    def __init__(self, workdir: Path, engine: GpuEngine, workers: int, retention_h: float):
-        self.root = workdir / "jobs"
-        self.root.mkdir(parents=True, exist_ok=True)
-        self.engine = engine
-        self.retention = retention_h * 3600
-        self.jobs: dict[str, Job] = {}
-        self.lock = threading.Lock()
-        self.queue: "queue.Queue[str]" = queue.Queue()
-        self._stop = threading.Event()
-        self._threads = [threading.Thread(target=self._worker, name=f"worker-{i}", daemon=True)
-                         for i in range(max(1, workers))]
-        self._threads.append(threading.Thread(target=self._janitor, name="janitor", daemon=True))
-        for t in self._threads:
-            t.start()
+# --------------------------------------------------------------------------- #
+# Session: one TCP client connection
+# --------------------------------------------------------------------------- #
 
-    def get(self, job_id: str) -> Job | None:
-        with self.lock:
-            return self.jobs.get(job_id)
+class ClientSession(threading.Thread):
+    """Handles a single connected client, running on its own thread."""
 
-    def create(self, *args) -> Job:
-        job = Job(*args, root=self.root)
-        with self.lock:
-            self.jobs[job.id] = job
-        return job
+    def __init__(self, server: "WorkerDaemon", sock: socket.socket, addr):
+        super().__init__(daemon=True, name=f"session-{addr[0]}:{addr[1]}")
+        self.server = server
+        self.sock = sock
+        self.addr = addr
+        self.session_id = uuid.uuid4().hex[:12]
+        self.client_id = "unknown"
+        self.send_lock = threading.Lock()
+        self.jobs: Dict[str, Job] = {}
+        self.alive = True
+        self.current_job_id: Optional[str] = None
+        self._last_activity = time.time()
 
-    def enqueue(self, job: Job) -> int:
-        job.enqueued_at = time.time()
-        job.set_state("queued", position=self.queue.qsize() + 1)
-        self.queue.put(job.id)
-        job.log(f"Queued (position {self.queue_position(job)})")
-        return self.queue_position(job)
+    # -- outbound helpers ------------------------------------------------- #
+    def send(self, msg_type: int, payload: bytes = b"") -> None:
+        with self.send_lock:
+            send_frame(self.sock, msg_type, payload)
 
-    def queue_position(self, job: Job) -> int:
-        with self.queue.mutex:
-            try:
-                return list(self.queue.queue).index(job.id) + 1
-            except ValueError:
-                return 0
+    def send_obj(self, msg_type: int, obj: dict) -> None:
+        import json
 
-    def cancel(self, job: Job) -> None:
-        job.cancel_event.set()
-        if job.state in ("uploading", "created", "queued"):
-            job.finished_at = time.time()
-            job.set_state("cancelled")
+        self.send(msg_type, json.dumps(obj, separators=(",", ":")).encode("utf-8"))
 
-    def remove(self, job_id: str) -> bool:
-        with self.lock:
-            job = self.jobs.get(job_id)
-            if not job or not job.terminal:
-                return False
-            del self.jobs[job_id]
-        shutil.rmtree(job.dir, ignore_errors=True)
-        return True
-
-    def active_count(self) -> int:
-        with self.lock:
-            return sum(1 for j in self.jobs.values() if not j.terminal)
-
-    def shutdown(self) -> None:
-        self._stop.set()
-        with self.lock:
-            for j in self.jobs.values():
-                j.cancel_event.set()
-
-    # ------------------------------------------------------------------ threads
-    def _worker(self) -> None:
-        while not self._stop.is_set():
-            try:
-                job_id = self.queue.get(timeout=1.0)
-            except queue.Empty:
-                continue
-            job = self.get(job_id)
-            if job is None or job.terminal:
-                continue
-            if job.cancel_event.is_set():
-                job.finished_at = time.time()
-                job.set_state("cancelled")
-                continue
-            self._run(job)
-
-    def _run(self, job: Job) -> None:
-        started = time.time()
-        wait = started - (job.enqueued_at or started)
-        job.set_state("running", queue_wait_s=round(wait, 3))
-        job.log(f"Job started (waited {wait:.1f}s in queue)")
-        try:
-            result = self.engine.run(job)
-            if job.kind == "transcode":
-                job.log("Hashing result for integrity check ...")
-                result["output_size"] = job.output_path.stat().st_size
-                result["output_sha256"] = sha256_file(str(job.output_path))
-            result["queue_wait_s"] = round(wait, 3)
-            result["kind"] = job.kind
-            job.result = result
-            job.finished_at = time.time()
-            job.log("Job finished successfully")
-            job.set_state("done", result=result)
-        except Cancelled:
-            job.finished_at = time.time()
-            job.log("Job cancelled")
-            job.set_state("cancelled")
-        except Exception as exc:  # noqa: BLE001 - report every failure to the client
-            log.exception("job %s failed", job.id)
-            job.error = str(exc)
-            job.finished_at = time.time()
-            job.log(f"ERROR: {exc}")
-            job.set_state("failed", error=str(exc))
-
-    def _janitor(self) -> None:
-        while not self._stop.wait(300):
-            now = time.time()
-            with self.lock:
-                stale = [j for j in self.jobs.values()
-                         if (j.terminal and now - (j.finished_at or j.created) > self.retention)
-                         or (not j.terminal and j.state == "uploading" and now - j.created > self.retention)]
-            for job in stale:
+    def close(self) -> None:
+        self.alive = False
+        for job in self.jobs.values():
+            if job.state in ("queued", "running"):
                 job.cancel_event.set()
-                with self.lock:
-                    self.jobs.pop(job.id, None)
-                shutil.rmtree(job.dir, ignore_errors=True)
-                log.info("janitor removed job %s", job.id[:8])
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+    # -- main loop -------------------------------------------------------- #
+    def run(self) -> None:
+        log.info("CONNECT  %s:%s session=%s", self.addr[0], self.addr[1], self.session_id)
+        set_socket_options(self.sock)
+        self.sock.settimeout(config.IDLE_TIMEOUT)
+        try:
+            while self.alive:
+                try:
+                    msg_type, payload = recv_frame(self.sock)
+                except socket.timeout:
+                    log.info("IDLE     %s session=%s (no traffic for %.0fs)",
+                             self.addr[0], self.session_id, config.IDLE_TIMEOUT)
+                    break
+                self._last_activity = time.time()
+                self._dispatch(msg_type, payload)
+        except (ConnectionError, OSError, ProtocolError) as exc:
+            log.warning("DISCONNECT %s session=%s reason=%s",
+                        self.addr[0], self.session_id, exc)
+        finally:
+            self.close()
+            self.server.unregister(self)
+            log.info("CLOSED   %s session=%s", self.addr[0], self.session_id)
+
+    # -- dispatch --------------------------------------------------------- #
+    def _dispatch(self, msg_type: int, payload: bytes) -> None:
+        import json
+
+        if msg_type == MsgType.HELLO:
+            self._handle_hello(payload)
+        elif msg_type == MsgType.PING:
+            self._handle_ping(payload)
+        elif msg_type == MsgType.JOB_SUBMIT:
+            self._handle_submit(payload)
+        elif msg_type == MsgType.FILE_BEGIN:
+            self._handle_file_transfer(payload)
+        elif msg_type == MsgType.OUTPUT_REQUEST:
+            self._handle_output_request(payload)
+        elif msg_type == MsgType.JOB_CANCEL:
+            self._handle_cancel(payload)
+        elif msg_type == MsgType.OUTPUT_ACK:
+            pass  # informational
+        else:
+            self.send_obj(MsgType.ERROR, {"error": f"unexpected message type {msg_type}"})
+
+    # -- Task 1: handshake & latency ------------------------------------- #
+    def _handle_hello(self, payload: bytes) -> None:
+        import json
+
+        try:
+            hello = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self.send_obj(MsgType.ERROR, {"error": "malformed HELLO"})
+            return
+
+        client_proto = int(hello.get("protocol_version", -1))
+        if client_proto != PROTOCOL_VERSION:
+            self.send_obj(MsgType.ERROR, {
+                "error": "protocol version mismatch",
+                "server_protocol": PROTOCOL_VERSION,
+                "client_protocol": client_proto,
+            })
+            return
+
+        self.client_id = str(hello.get("client_id", "unknown"))[:64]
+        env = detect()
+        self.send_obj(MsgType.HELLO_ACK, {
+            "protocol_version": PROTOCOL_VERSION,
+            "session_id": self.session_id,
+            "server_id": env.hostname,
+            "server_time": time.time(),
+            "echo_nonce": hello.get("nonce"),
+            "environment": env.to_dict(),
+            "supported_tasks": list(config.SUPPORTED_TASKS),
+            "max_chunk_size": config.CHUNK_SIZE,
+            "queue_limit": config.MAX_QUEUE_DEPTH,
+        })
+        log.info("HANDSHAKE client=%s session=%s proto=%s",
+                 self.client_id, self.session_id, client_proto)
+
+    def _handle_ping(self, payload: bytes) -> None:
+        import json
+
+        try:
+            ping = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            ping = {}
+        self.send_obj(MsgType.PONG, {
+            "seq": ping.get("seq", 0),
+            "client_timestamp": ping.get("client_timestamp"),
+            "server_timestamp": time.time(),
+        })
+
+    # -- Task 2/4: submission -------------------------------------------- #
+    def _handle_submit(self, payload: bytes) -> None:
+        import json
+
+        try:
+            spec = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self.send_obj(MsgType.JOB_REJECTED, {"error": "malformed JOB_SUBMIT"})
+            return
+
+        task = str(spec.get("task", ""))
+        if task not in config.SUPPORTED_TASKS:
+            self.send_obj(MsgType.JOB_REJECTED, {
+                "error": f"unsupported task '{task}'",
+                "supported": list(config.SUPPORTED_TASKS),
+            })
+            return
+
+        input_name = safe_filename(str(spec.get("input_name", "input.bin")))
+        input_size = int(spec.get("input_size", 0))
+        if input_size < 0 or input_size > config.MAX_INPUT_BYTES:
+            self.send_obj(MsgType.JOB_REJECTED, {
+                "error": f"input size {input_size} exceeds limit",
+            })
+            return
+
+        if self.server.queue_depth() >= config.MAX_QUEUE_DEPTH:
+            self.send_obj(MsgType.JOB_REJECTED, {"error": "worker queue is full, retry shortly"})
+            return
+
+        output_name = safe_filename(str(spec.get("output_name") or f"output_{uuid.uuid4().hex[:8]}.bin"))
+        job = Job(
+            job_id=uuid.uuid4().hex[:12],
+            task=task,
+            params=spec.get("params") or {},
+            input_name=input_name,
+            input_size=input_size,
+            input_sha256=str(spec.get("input_sha256", "")).lower(),
+            output_name=output_name,
+            owner=self,
+        )
+        self.jobs[job.job_id] = job
+        self.server.register_job(job)
+
+        self.send_obj(MsgType.JOB_ACCEPTED, {
+            "job_id": job.job_id,
+            "queue_position": self.server.queue_depth(),
+            "input_name": input_name,
+            "message": "send FILE_BEGIN to upload the input asset",
+        })
+        log.info("ACCEPT   job=%s task=%s client=%s size=%s",
+                 job.job_id, task, self.client_id, input_size)
+
+    # -- input transfer with integrity check ------------------------------ #
+    def _handle_file_transfer(self, payload: bytes) -> None:
+        import json
+
+        try:
+            begin = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self.send_obj(MsgType.FILE_ACK, {"ok": False, "error": "malformed FILE_BEGIN"})
+            return
+
+        job_id = str(begin.get("job_id", ""))
+        job = self.jobs.get(job_id)
+        if job is None:
+            self.send_obj(MsgType.FILE_ACK, {"ok": False, "error": f"unknown job {job_id}"})
+            return
+        if job.state != "queued":
+            self.send_obj(MsgType.FILE_ACK, {"ok": False, "error": f"job already {job.state}"})
+            return
+
+        declared_size = int(begin.get("size", -1))
+        declared_sha = str(begin.get("sha256", "")).lower()
+        if declared_size < 0 or declared_size > config.MAX_INPUT_BYTES:
+            self.send_obj(MsgType.FILE_ACK, {"ok": False, "error": "illegal size"})
+            return
+
+        job.stage = "receiving"
+        os.makedirs(config.SERVER_WORK_DIR, exist_ok=True)
+        tmp_path = os.path.join(config.SERVER_WORK_DIR, f"{job.job_id}_{job.input_name}.part")
+        received = 0
+        self.sock.settimeout(config.IO_TIMEOUT)
+        try:
+            with open(tmp_path, "wb") as handle:
+                while received < declared_size:
+                    msg_type, chunk = recv_frame(self.sock)
+                    if msg_type == MsgType.JOB_CANCEL:
+                        raise ExecutorError("upload cancelled by client")
+                    if msg_type != MsgType.FILE_CHUNK:
+                        raise ProtocolError(f"expected FILE_CHUNK, got type {msg_type}")
+                    if not chunk:
+                        raise ProtocolError("empty chunk")
+                    handle.write(chunk)
+                    received += len(chunk)
+                    if received > config.MAX_INPUT_BYTES:
+                        raise ProtocolError("transfer exceeded size limit")
+                    if received % (32 * config.CHUNK_SIZE) < config.CHUNK_SIZE:
+                        pct = 100.0 * received / max(declared_size, 1)
+                        self.send_obj(MsgType.PROGRESS, {
+                            "job_id": job_id, "percent": round(min(pct, 99.0), 2),
+                            "stage": "upload", "received": received, "total": declared_size,
+                        })
+
+                # Trailing FILE_END frame
+                msg_type, end_payload = recv_frame(self.sock)
+                if msg_type != MsgType.FILE_END:
+                    raise ProtocolError("expected FILE_END after chunks")
+                try:
+                    end = json.loads(end_payload.decode("utf-8"))
+                except Exception:
+                    end = {}
+                declared_sha = str(end.get("sha256", declared_sha)).lower()
+        except (ConnectionError, OSError, ProtocolError, ExecutorError) as exc:
+            self.send_obj(MsgType.FILE_ACK, {"ok": False, "job_id": job_id, "error": str(exc)})
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            job.state = "failed"
+            job.error = f"upload failed: {exc}"
+            return
+        finally:
+            self.sock.settimeout(config.IDLE_TIMEOUT)
+
+        actual_sha = sha256_file(tmp_path)
+        actual_size = os.path.getsize(tmp_path)
+        ok = (actual_size == declared_size) and (actual_sha == declared_sha)
+        if not ok:
+            self.send_obj(MsgType.FILE_ACK, {
+                "ok": False, "job_id": job_id,
+                "error": "checksum/size mismatch",
+                "expected_size": declared_size, "actual_size": actual_size,
+                "expected_sha256": declared_sha, "actual_sha256": actual_sha,
+            })
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            job.state = "failed"
+            job.error = "input integrity check failed"
+            log.warning("CHECKSUM job=%s FAILED expected=%s actual=%s",
+                        job_id, declared_sha[:12], actual_sha[:12])
+            return
+
+        job.input_path = tmp_path
+        job.stage = "queued"
+        self.send_obj(MsgType.FILE_ACK, {
+            "ok": True, "job_id": job_id,
+            "size": actual_size, "sha256": actual_sha,
+            "message": "integrity verified, job queued for execution",
+        })
+        log.info("UPLOAD   job=%s bytes=%s sha256=%s OK", job_id, actual_size, actual_sha[:16])
+        self.server.enqueue(job)
+
+    # -- output download --------------------------------------------------- #
+    def _handle_output_request(self, payload: bytes) -> None:
+        import json
+
+        try:
+            req = json.loads(payload.decode("utf-8"))
+        except Exception:
+            req = {}
+        job_id = str(req.get("job_id", ""))
+        job = self.jobs.get(job_id)
+        if job is None or job.state != "done" or not job.output_path:
+            self.send_obj(MsgType.ERROR, {"error": f"no completed output for job {job_id}"})
+            return
+        if not os.path.exists(job.output_path):
+            self.send_obj(MsgType.ERROR, {"error": "output file missing on worker"})
+            return
+
+        size = os.path.getsize(job.output_path)
+        digest = sha256_file(job.output_path)
+        self.send_obj(MsgType.OUTPUT_BEGIN, {
+            "job_id": job_id, "name": job.output_name,
+            "size": size, "sha256": digest,
+        })
+        sent = 0
+        with self.send_lock:
+            try:
+                with open(job.output_path, "rb") as handle:
+                    while True:
+                        block = handle.read(config.CHUNK_SIZE)
+                        if not block:
+                            break
+                        send_frame(self.sock, MsgType.OUTPUT_CHUNK, block)
+                        sent += len(block)
+                send_frame(self.sock, MsgType.OUTPUT_END, json.dumps({
+                    "job_id": job_id, "size": sent, "sha256": digest,
+                }).encode("utf-8"))
+            except OSError as exc:
+                log.warning("OUTPUT   job=%s failed: %s", job_id, exc)
+                return
+        log.info("DOWNLOAD job=%s bytes=%s sha256=%s", job_id, sent, digest[:16])
+
+    def _handle_cancel(self, payload: bytes) -> None:
+        import json
+
+        try:
+            req = json.loads(payload.decode("utf-8"))
+        except Exception:
+            req = {}
+        job = self.jobs.get(str(req.get("job_id", "")))
+        if job and job.state in ("queued", "running"):
+            job.cancel_event.set()
+            job.state = "cancelled"
+            self.send_obj(MsgType.LOG, {"job_id": job.job_id, "level": "warning",
+                                        "message": "cancellation requested by client"})
+
+    # -- called from job runner ------------------------------------------- #
+    def emit_progress(self, job: Job, percent: float, stage: str, info: Optional[dict] = None) -> None:
+        if not self.alive:
+            return
+        job.percent = max(job.percent, percent) if stage != "upload" else percent
+        job.stage = stage
+        try:
+            self.send_obj(MsgType.PROGRESS, {
+                "job_id": job.job_id,
+                "percent": round(percent, 2),
+                "stage": stage,
+                "elapsed": round(job.elapsed, 2),
+                **(info or {}),
+            })
+        except OSError:
+            self.alive = False
+
+    def emit_log(self, job_id: str, message: str, level: str = "info") -> None:
+        if not self.alive:
+            return
+        try:
+            self.send_obj(MsgType.LOG, {"job_id": job_id, "level": level,
+                                        "message": message, "ts": time.time()})
+        except OSError:
+            self.alive = False
+
+    def emit_heartbeat(self, job: Job) -> None:
+        if not self.alive:
+            return
+        try:
+            self.send_obj(MsgType.HEARTBEAT, {
+                "job_id": job.job_id, "state": job.state,
+                "stage": job.stage, "percent": round(job.percent, 2),
+                "queue_depth": self.server.queue_depth(),
+            })
+        except OSError:
+            self.alive = False
 
 
-# =========================================================================== server
-class WorkerServer:
-    def __init__(self, host: str, port: int, token: str, workdir: Path, engine: GpuEngine,
-                 workers: int = 1, max_gb: float = 20.0, retention_h: float = 24.0):
-        self.host, self.port, self.token = host, port, token
-        self.workdir = workdir
-        self.engine = engine
-        self.max_bytes = int(max_gb * 1024 ** 3)
-        self.mgr = JobManager(workdir, engine, workers, retention_h)
-        self.workers = workers
-        self._sock: socket.socket | None = None
+# --------------------------------------------------------------------------- #
+# Worker daemon
+# --------------------------------------------------------------------------- #
+
+class WorkerDaemon:
+    """Threaded TCP server with a bounded background worker pool."""
+
+    def __init__(self, host: str = "0.0.0.0", port: int = config.DEFAULT_PORT,
+                 workers: int = 2, workdir: Optional[str] = None):
+        self.host = host
+        self.port = port
+        self.workers = max(1, workers)
+        self.workdir = workdir or config.SERVER_WORK_DIR
+        self.env = detect()
+
+        self.jobs_lock = threading.Lock()
+        self.jobs: Dict[str, Job] = {}
+        self.queue: "queue.Queue[Job]" = queue.Queue(maxsize=config.MAX_QUEUE_DEPTH)
+        self.sessions: List[ClientSession] = []
+
+        self._listener: Optional[socket.socket] = None
+        self._accept_thread: Optional[threading.Thread] = None
+        self._worker_threads: List[threading.Thread] = []
+        self._heartbeat_thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
-        self._accept_thread: threading.Thread | None = None
 
-    # ------------------------------------------------------------------ lifecycle
-    def start(self) -> "WorkerServer":
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind((self.host, self.port))
-        self.port = self._sock.getsockname()[1]
-        self._sock.listen(16)
-        self._sock.settimeout(1.0)
-        self._accept_thread = threading.Thread(target=self._accept_loop, name="acceptor", daemon=True)
+    # -- lifecycle -------------------------------------------------------- #
+    def start(self) -> None:
+        os.makedirs(self.workdir, exist_ok=True)
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind((self.host, self.port))
+        listener.listen(16)
+        listener.settimeout(1.0)
+        self._listener = listener
+        if self.port == 0:
+            self.port = listener.getsockname()[1]
+
+        for i in range(self.workers):
+            t = threading.Thread(target=self._worker_loop, name=f"worker-{i}", daemon=True)
+            t.start()
+            self._worker_threads.append(t)
+
+        self._accept_thread = threading.Thread(target=self._accept_loop,
+                                               name="accept", daemon=True)
         self._accept_thread.start()
-        return self
+
+        self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop,
+                                                  name="heartbeat", daemon=True)
+        self._heartbeat_thread.start()
+
+        log.info("=" * 72)
+        log.info("  CSC-334 Distributed Task Offloading - Worker Daemon")
+        log.info("  listening on %s:%s  (workers=%d)", self.host, self.port, self.workers)
+        log.info("  GPU      : %s", self.env.gpu_label)
+        log.info("  Encoders : %s", ", ".join(self.env.encoders) or "none (CPU only)")
+        log.info("  FFmpeg   : %s", self.env.ffmpeg_path or "not found")
+        log.info("  CUDA     : %s", self.env.cuda_available)
+        log.info("  Tasks    : %s", ", ".join(config.SUPPORTED_TASKS))
+        log.info("=" * 72)
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._listener:
+            try:
+                self._listener.close()
+            except OSError:
+                pass
+        for session in list(self.sessions):
+            session.close()
+        log.info("daemon stopped")
 
     def serve_forever(self) -> None:
         self.start()
         try:
-            while not self._stop.wait(0.5):
-                pass
-        finally:
+            while not self._stop.is_set():
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            log.info("Ctrl+C received, shutting down...")
             self.stop()
 
-    def stop(self) -> None:
-        self._stop.set()
-        self.mgr.shutdown()
-        if self._sock:
-            try:
-                self._sock.close()
-            except OSError:
-                pass
-            self._sock = None
-
+    # -- accept loop ------------------------------------------------------ #
     def _accept_loop(self) -> None:
+        assert self._listener is not None
         while not self._stop.is_set():
             try:
-                conn, addr = self._sock.accept()
+                sock, addr = self._listener.accept()
             except socket.timeout:
                 continue
             except OSError:
                 break
-            threading.Thread(target=self._serve_conn, args=(conn, addr), daemon=True).start()
+            session = ClientSession(self, sock, addr)
+            self.sessions.append(session)
+            session.start()
 
-    # ------------------------------------------------------------------ info
-    def info(self) -> dict:
-        free = shutil.disk_usage(self.workdir).free
-        return {"type": "OK", "version": PROTOCOL_VERSION, "server": socket.gethostname(),
-                "workers": self.workers, "queue_length": self.mgr.queue.qsize(),
-                "active_jobs": self.mgr.active_count(), "free_disk_gb": round(free / 1024 ** 3, 1),
-                **self.engine.describe()}
+    def unregister(self, session: ClientSession) -> None:
+        if session in self.sessions:
+            self.sessions.remove(session)
 
-    # ------------------------------------------------------------------ connection
-    def _serve_conn(self, conn: socket.socket, addr) -> None:
-        tag = f"{addr[0]}:{addr[1]}"
-        conn.settimeout(IDLE_TIMEOUT)
-        tune_socket(conn)
-        try:
-            if not self._handshake(conn, tag):
-                return
-            while not self._stop.is_set():
-                msg = recv_json(conn)
-                mtype = msg.get("type")
-                if mtype == "PING":
-                    send_json(conn, {"type": "PONG", "seq": msg.get("seq"), "t": msg.get("t"),
-                                     "server_time": time.time()})
-                elif mtype == "INFO":
-                    send_json(conn, self.info())
-                elif mtype == "BWTEST":
-                    self._bwtest(conn, msg)
-                elif mtype == "SUBMIT":
-                    self._submit(conn, msg, tag)
-                elif mtype == "WATCH":
-                    self._watch(conn, msg)
-                elif mtype == "FETCH":
-                    self._fetch(conn, msg, tag)
-                elif mtype == "CANCEL":
-                    job = self._job_or_error(conn, msg)
-                    if job:
-                        self.mgr.cancel(job)
-                        send_json(conn, {"type": "OK", "state": job.state})
-                elif mtype == "CLEANUP":
-                    send_json(conn, {"type": "OK", "removed": self.mgr.remove(str(msg.get("job_id")))})
-                elif mtype == "BYE":
-                    break
-                else:
-                    send_error(conn, "bad_request", f"unknown message type {mtype!r}")
-        except (ProtocolError, OSError) as exc:
-            log.info("connection %s closed: %s", tag, exc)
-        except Exception:  # noqa: BLE001
-            log.exception("unexpected error on connection %s", tag)
-        finally:
+    # -- job registry / queue --------------------------------------------- #
+    def register_job(self, job: Job) -> None:
+        with self.jobs_lock:
+            self.jobs[job.job_id] = job
+
+    def queue_depth(self) -> int:
+        return self.queue.qsize()
+
+    def enqueue(self, job: Job) -> None:
+        self.queue.put(job)
+
+    def _worker_loop(self) -> None:
+        while not self._stop.is_set():
             try:
-                conn.close()
-            except OSError:
-                pass
+                job = self.queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            self._execute(job)
+            self.queue.task_done()
 
-    def _handshake(self, conn: socket.socket, tag: str) -> bool:
-        nonce = make_nonce()
-        send_json(conn, {"type": "WELCOME", "version": PROTOCOL_VERSION, "nonce": nonce,
-                         "server": socket.gethostname()})
-        hello = recv_json(conn)
-        if hello.get("type") != "HELLO":
-            send_error(conn, "bad_request", "expected HELLO")
-            return False
-        if hello.get("version") != PROTOCOL_VERSION:
-            send_error(conn, "version", f"protocol version mismatch (worker speaks {PROTOCOL_VERSION})")
-            return False
-        if not verify_auth(self.token, nonce, hello.get("auth", "")):
-            log.warning("authentication failed from %s", tag)
-            time.sleep(0.5)  # slow down brute force
-            send_error(conn, "auth", "authentication failed (wrong token)")
-            return False
-        log.info("client %s authenticated (%s)", tag, hello.get("client", "?"))
-        send_json(conn, self.info())
-        return True
+    # -- execution --------------------------------------------------------- #
+    def _execute(self, job: Job) -> None:
+        session = job.owner
+        if job.cancel_event.is_set() or not session.alive:
+            job.state = "cancelled"
+            return
 
-    # ------------------------------------------------------------------ handlers
-    def _job_or_error(self, conn, msg):
-        job = self.mgr.get(str(msg.get("job_id", "")))
-        if job is None:
-            send_error(conn, "unknown_job", "no such job on this worker")
-        return job
+        job.state = "running"
+        job.started_at = time.time()
+        job.stage = "running"
+        session.emit_log(job.job_id, f"worker started task '{job.task}' "
+                                     f"(job {job.job_id}) on {self.env.hostname}")
 
-    def _bwtest(self, conn: socket.socket, msg: dict) -> None:
-        size = max(1, min(int(msg.get("size", 16 * 1024 * 1024)), 256 * 1024 * 1024))
-        direction = msg.get("direction", "up")
-        send_json(conn, {"type": "BW_READY", "size": size})
-        t0 = time.perf_counter()
-        if direction == "up":  # client -> worker
-            recv_file_range(conn, NullSink(), size)
-            send_json(conn, {"type": "BW_RESULT", "bytes": size,
-                             "seconds": round(time.perf_counter() - t0, 6)})
-        else:  # worker -> client
-            block = os.urandom(1024 * 1024)
-            sent = 0
-            while sent < size:
-                n = min(len(block), size - sent)
-                send_data(conn, block[:n])
-                sent += n
+        os.makedirs(self.workdir, exist_ok=True)
+        output_path = os.path.join(self.workdir, f"{job.job_id}_{job.output_name}")
 
-    def _submit(self, conn: socket.socket, msg: dict, tag: str) -> None:
-        job_id = str(msg.get("job_id", ""))
-        kind = msg.get("kind", "transcode")
-        if not JOB_ID_RE.match(job_id):
-            return send_error(conn, "bad_job_id", "job_id must be 32 hex characters")
-        if kind not in ("transcode", "torch"):
-            return send_error(conn, "bad_kind", "kind must be 'transcode' or 'torch'")
+        last_heartbeat = 0.0
+
+        def progress_cb(percent: float, info: dict) -> None:
+            nonlocal last_heartbeat
+            session.emit_progress(job, float(percent), job.task, info)
+            now = time.time()
+            if now - last_heartbeat >= config.HEARTBEAT_INTERVAL:
+                last_heartbeat = now
+                session.emit_heartbeat(job)
+
+        def log_cb(message: str) -> None:
+            session.emit_log(job.job_id, message)
+
         try:
-            settings = (normalize_settings(msg.get("settings")) if kind == "transcode"
-                        else normalize_torch_settings(msg.get("settings")))
-        except ValueError as exc:
-            return send_error(conn, "bad_settings", str(exc))
+            executor = get_executor(job.task)
+            result = executor.run(
+                input_path=job.input_path or "",
+                output_path=output_path,
+                params=job.params,
+                progress_cb=progress_cb,
+                log_cb=log_cb,
+                cancel_event=job.cancel_event,
+            )
+            # Some executors write <path>.npy - normalise to the real file.
+            if not os.path.exists(output_path) and os.path.exists(output_path + ".npy"):
+                output_path += ".npy"
+            if not os.path.exists(output_path):
+                raise ExecutorError("executor produced no output artefact")
 
-        job = self.mgr.get(job_id)
-        if kind == "torch":
-            if job is None:
-                job = self.mgr.create(job_id, kind, "tensor-task", 0, "", settings)
-                self.mgr.enqueue(job)
-            return send_json(conn, {"type": "ACCEPT", "job_id": job_id, "offset": 0,
-                                    "upload_required": False, "state": job.state})
+            job.output_path = output_path
+            job.state = "done"
+            job.percent = 100.0
+            job.stage = "done"
+            job.result = result
+            job.finished_at = time.time()
 
-        sha = str(msg.get("sha256", "")).lower()
-        try:
-            size = int(msg.get("size", 0))
-        except (TypeError, ValueError):
-            size = 0
-        if not SHA_RE.match(sha) or size <= 0:
-            return send_error(conn, "bad_request", "size and sha256 are required")
-        if size > self.max_bytes:
-            return send_error(conn, "too_large", f"file exceeds the {human_bytes(self.max_bytes)} limit")
-        filename = os.path.basename(str(msg.get("filename", "input.bin")))[:120]
+            size = os.path.getsize(output_path)
+            digest = sha256_file(output_path)
+            session.emit_progress(job, 100.0, "done", {
+                "engine": result.get("engine"), "elapsed": round(job.elapsed, 2)})
+            session.send_obj(MsgType.JOB_DONE, {
+                "job_id": job.job_id,
+                "state": "done",
+                "duration_s": round(job.elapsed, 3),
+                "output": {
+                    "name": job.output_name if output_path.endswith(job.output_name)
+                    else os.path.basename(output_path),
+                    "size": size,
+                    "sha256": digest,
+                },
+                "result": result,
+            })
+            log.info("DONE     job=%s task=%s engine=%s %.2fs bytes=%s",
+                     job.job_id, job.task, result.get("engine"), job.elapsed, size)
 
-        if job is None:
-            if shutil.disk_usage(self.workdir).free < size * 3:
-                return send_error(conn, "no_space", "not enough free disk space on the worker")
-            job = self.mgr.create(job_id, kind, filename, size, sha, settings)
-        elif job.sha256 != sha or job.size != size:
-            return send_error(conn, "job_conflict", "job id already used for a different file")
-
-        if job.state != "uploading":  # upload already finished earlier (client lost our answer)
-            return send_json(conn, {"type": "ACCEPT", "job_id": job_id, "offset": size,
-                                    "upload_required": False, "state": job.state})
-
-        if not job.upload_lock.acquire(blocking=False):
-            # A stale connection of the same job still holds the lock: kick it out.
-            old = job.upload_conn
-            if old is not None:
+        except ExecutorError as exc:
+            if job.cancel_event.is_set():
+                job.state = "cancelled"
+                job.error = "cancelled"
+                session.send_obj(MsgType.JOB_FAILED,
+                                 {"job_id": job.job_id, "state": "cancelled",
+                                  "error": "job cancelled by client"})
+                log.info("CANCEL   job=%s", job.job_id)
+                return
+            self._fail(job, str(exc))
+        except Exception as exc:  # noqa: BLE001 - report any executor crash
+            self._fail(job, f"{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=6)}")
+        finally:
+            if job.input_path and os.path.exists(job.input_path):
                 try:
-                    old.shutdown(socket.SHUT_RDWR)
+                    os.remove(job.input_path)
                 except OSError:
                     pass
-            if not job.upload_lock.acquire(timeout=10):
-                return send_error(conn, "busy", "another upload of this job is still in progress")
+            job.finished_at = job.finished_at or time.time()
+
+    def _fail(self, job: Job, error: str) -> None:
+        job.state = "failed"
+        job.error = error
+        job.finished_at = time.time()
+        session = job.owner
         try:
-            job.upload_conn = conn
-            have = job.input_path.stat().st_size if job.input_path.exists() else 0
-            if have > size:
-                job.input_path.unlink()
-                have = 0
-            send_json(conn, {"type": "ACCEPT", "job_id": job_id, "offset": have,
-                             "upload_required": True, "state": job.state})
-            job.log(f"Receiving {job.filename} ({human_bytes(size)}) from {tag}, resuming at {human_bytes(have)}"
-                    if have else f"Receiving {job.filename} ({human_bytes(size)}) from {tag}")
-            with open(job.input_path, "ab" if have else "wb") as fh:
-                recv_file_range(conn, fh, size - have)
-            job.log("Upload complete - verifying SHA-256 ...")
-            actual = sha256_file(str(job.input_path))
-            if actual != sha:
-                job.input_path.unlink(missing_ok=True)
-                job.log("Checksum mismatch - upload discarded, client must resend")
-                return send_json(conn, {"type": "UPLOAD_BAD", "reason": "checksum mismatch"})
-            job.log("Checksum OK")
-            send_json(conn, {"type": "UPLOAD_OK"})
-            pos = self.mgr.enqueue(job)
-            send_json(conn, {"type": "QUEUED", "job_id": job_id, "position": pos})
-        finally:
-            job.upload_conn = None
-            job.upload_lock.release()
+            session.send_obj(MsgType.JOB_FAILED,
+                             {"job_id": job.job_id, "state": "failed",
+                              "error": error[:4000]})
+            session.emit_log(job.job_id, f"job failed: {error.splitlines()[0]}", level="error")
+        except OSError:
+            session.alive = False
+        log.error("FAILED   job=%s error=%s", job.job_id, error.splitlines()[0] if error else "?")
 
-    def _watch(self, conn: socket.socket, msg: dict) -> None:
-        job = self._job_or_error(conn, msg)
-        if job is None:
-            return
-        idx = max(0, int(msg.get("since", 0)))
-        send_json(conn, {"type": "WATCH_OK", "state": job.state, "events": len(job.events)})
-        last_version = -1
+    # -- keep-alive for queued jobs ---------------------------------------- #
+    def _heartbeat_loop(self) -> None:
         while not self._stop.is_set():
-            with job.cond:
-                if job.version == last_version and not job.terminal:
-                    job.cond.wait(timeout=2.0)
-                last_version = job.version
-                pending = job.events[idx:]
-                prog = dict(job.progress)
-                state = job.state
-                terminal = job.terminal
-            for ev in pending:
-                send_json(conn, ev)
-            idx += len(pending)
-            if state == "queued":
-                prog = {"stage": "queued", "position": self.mgr.queue_position(job)}
-            if prog and not terminal:
-                send_json(conn, {"type": "PROGRESS", **prog})
-            elif not pending:
-                send_json(conn, {"type": "HEARTBEAT"})
-            if terminal:
-                break
-        send_json(conn, {"type": "WATCH_END", "state": job.state})
+            time.sleep(config.HEARTBEAT_INTERVAL)
+            with self.jobs_lock:
+                pending = [j for j in self.jobs.values() if j.state == "queued"]
+            for job in pending:
+                job.owner.emit_heartbeat(job)
 
-    def _fetch(self, conn: socket.socket, msg: dict, tag: str) -> None:
-        job = self._job_or_error(conn, msg)
-        if job is None:
-            return
-        if job.state != "done" or job.kind != "transcode":
-            return send_error(conn, "not_ready", f"job is {job.state}, no result to fetch")
-        size = job.result["output_size"]
-        offset = max(0, min(int(msg.get("offset", 0)), size))
-        send_json(conn, {"type": "RESULT", "size": size, "sha256": job.result["output_sha256"],
-                         "offset": offset, "filename": "output.mp4"})
-        job.log(f"Sending result to {tag} from offset {human_bytes(offset)}")
-        send_file_range(conn, str(job.output_path), offset, size)
+    # -- introspection ------------------------------------------------------ #
+    def stats(self) -> dict:
+        with self.jobs_lock:
+            states: Dict[str, int] = {}
+            for job in self.jobs.values():
+                states[job.state] = states.get(job.state, 0) + 1
+        return {
+            "host": self.host,
+            "port": self.port,
+            "workers": self.workers,
+            "queue_depth": self.queue_depth(),
+            "active_sessions": len(self.sessions),
+            "jobs": states,
+            "environment": self.env.to_dict(),
+        }
 
 
-# =========================================================================== CLI
-def daemonize(pidfile: str | None) -> None:
-    if os.name != "posix":
-        raise SystemExit("--daemon is only supported on Linux/macOS. On Windows use scripts/run_server.bat "
-                         "or Task Scheduler (see README).")
-    if os.fork() > 0:
-        os._exit(0)
-    os.setsid()
-    if os.fork() > 0:
-        os._exit(0)
-    os.chdir("/")
-    devnull = os.open(os.devnull, os.O_RDWR)
-    for fd in (0, 1, 2):
-        os.dup2(devnull, fd)
-    if pidfile:
-        Path(pidfile).write_text(str(os.getpid()))
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
 
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="CSC-334 Distributed Task Offloading - remote GPU worker daemon")
+    parser.add_argument("--host", default="0.0.0.0",
+                        help="bind address (default 0.0.0.0 = all interfaces)")
+    parser.add_argument("--port", type=int, default=config.DEFAULT_PORT,
+                        help=f"TCP port (default {config.DEFAULT_PORT})")
+    parser.add_argument("--workers", type=int, default=2,
+                        help="number of concurrent job workers (default 2)")
+    parser.add_argument("--workdir", default=config.SERVER_WORK_DIR,
+                        help="directory for received inputs and rendered outputs")
+    parser.add_argument("--log-level", default="INFO",
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    args = parser.parse_args(argv)
 
-def setup_logging(workdir: Path, verbose: bool, foreground: bool) -> None:
-    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s", "%H:%M:%S")
-    root = logging.getLogger()
-    root.setLevel(logging.DEBUG if verbose else logging.INFO)
-    fh = logging.handlers.RotatingFileHandler(workdir / "worker.log", maxBytes=5_000_000, backupCount=3)
-    fh.setFormatter(fmt)
-    root.addHandler(fh)
-    if foreground:
-        sh = logging.StreamHandler()
-        sh.setFormatter(fmt)
-        root.addHandler(sh)
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s | %(levelname)-7s | %(threadName)-11s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
 
-
-def main(argv=None) -> int:
-    p = argparse.ArgumentParser(description="GPU worker daemon for distributed task offloading")
-    p.add_argument("--host", default="0.0.0.0", help="bind address (default 0.0.0.0)")
-    p.add_argument("--port", type=int, default=DEFAULT_PORT)
-    p.add_argument("--token", default=os.environ.get("OFFLOAD_TOKEN", DEFAULT_TOKEN),
-                   help="shared secret (or env OFFLOAD_TOKEN)")
-    p.add_argument("--workdir", default=str(ROOT / "server" / "workdir"))
-    p.add_argument("--engine", choices=["auto", "gpu", "cpu"], default="auto",
-                   help="auto: NVENC if available else CPU; gpu: require NVENC; cpu: force software")
-    p.add_argument("--no-hwdecode", action="store_true", help="do not use -hwaccel cuda for decoding")
-    p.add_argument("--workers", type=int, default=1, help="concurrent GPU jobs (default 1)")
-    p.add_argument("--max-gb", type=float, default=20.0, help="max accepted upload size")
-    p.add_argument("--retention-hours", type=float, default=24.0)
-    p.add_argument("--daemon", action="store_true", help="detach into the background (Linux/macOS)")
-    p.add_argument("--pidfile", default=None)
-    p.add_argument("-v", "--verbose", action="store_true")
-    args = p.parse_args(argv)
-
-    workdir = Path(args.workdir).resolve()
-    workdir.mkdir(parents=True, exist_ok=True)
-    setup_logging(workdir, args.verbose, foreground=not args.daemon)
-    pidfile = str(Path(args.pidfile).resolve()) if args.pidfile else None
-    if args.daemon:
-        daemonize(pidfile)
-
-    try:
-        engine = GpuEngine(mode=args.engine, hwdecode=not args.no_hwdecode)
-    except EngineError as exc:
-        log.error("%s", exc)
-        return 2
-    server = WorkerServer(args.host, args.port, args.token, workdir, engine,
-                          workers=args.workers, max_gb=args.max_gb, retention_h=args.retention_hours)
-
-    def _sig(*_):
-        log.info("shutting down ...")
-        server._stop.set()
-
-    signal.signal(signal.SIGINT, _sig)
-    signal.signal(signal.SIGTERM, _sig)
-
-    d = engine.describe()
-    log.info("=" * 60)
-    log.info("GPU worker daemon listening on %s:%d", args.host, server.port if server._sock else args.port)
-    log.info("Reachable at: %s", ", ".join(local_ips()) or "(no external IPv4 found)")
-    log.info("GPU(s): %s", "; ".join(f"{g['name']} {g['memory_mb']}MB" for g in d["gpus"]) or "none detected")
-    log.info("NVENC: %s | %s | torch: %s", "available" if d["nvenc"] else "NOT available (CPU fallback)",
-             d["ffmpeg"][:40], d["torch"])
-    if args.token == DEFAULT_TOKEN:
-        log.warning("Using the default token - set --token or OFFLOAD_TOKEN for real use!")
-    log.info("Work directory: %s", workdir)
-    log.info("=" * 60)
-    try:
-        server.serve_forever()
-    except OSError as exc:
-        log.error("cannot start server: %s", exc)
-        return 1
+    daemon = WorkerDaemon(host=args.host, port=args.port,
+                          workers=args.workers, workdir=args.workdir)
+    daemon.serve_forever()
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

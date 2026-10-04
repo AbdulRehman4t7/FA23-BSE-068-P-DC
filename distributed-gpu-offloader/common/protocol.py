@@ -1,247 +1,201 @@
-"""Wire protocol shared by the client and the GPU worker daemon.
-
-Every message on the TCP stream is a *frame*:
-
-    +--------+-----------------+----------------------+
-    | 1 byte | 4 bytes (BE)    | <length> bytes       |
-    | type   | payload length  | payload              |
-    +--------+-----------------+----------------------+
-
-    type 'J' -> payload is a UTF-8 JSON object (control message)
-    type 'D' -> payload is raw binary data (file chunk)
-
-Handshake (Task 1)
-------------------
-    worker -> client : WELCOME {version, nonce, server}
-    client -> worker : HELLO   {version, client, auth=HMAC-SHA256(token, nonce)}
-    worker -> client : OK {server info}        or  ERROR {code:'auth'|'version'}
-
-After the handshake the client may send PING / BWTEST / INFO / SUBMIT / WATCH /
-FETCH / CANCEL / CLEANUP / BYE requests (see server/daemon.py).
 """
+CSC-334 : Parallel and Distributed Computing
+Lab 04 : Custom Distributed Task Offloading & Remote GPU Rendering System
+
+common/protocol.py
+------------------
+Wire protocol shared by the client and the server daemon.
+
+Framing layout (every message on the socket):
+
+    +-----------------+--------------+-------------------+
+    | length (4 bytes) | type (1 byte)| payload (N bytes) |
+    | uint32 big-endian| uint8        | N = length        |
+    +-----------------+--------------+-------------------+
+
+* ``length`` is the length of the *payload* only (not counting the 5-byte header).
+* ``type`` identifies the message (see :class:`MsgType`).
+* Control messages carry a UTF-8 encoded JSON object as payload.
+* Bulk data (file chunks) carries raw bytes as payload.
+
+This gives us deterministic framing (no delimiters, no ambiguity), cheap
+error detection (bad magic/length -> protocol error) and the ability to
+mix JSON control traffic with binary bulk transfers on one socket.
+"""
+
 from __future__ import annotations
 
+import enum
 import hashlib
-import hmac
 import json
 import os
 import socket
 import struct
-from typing import Callable, Optional
+import time
+from typing import Any, Optional, Tuple
+
+# --------------------------------------------------------------------------- #
+# Protocol constants
+# --------------------------------------------------------------------------- #
 
 PROTOCOL_VERSION = 1
-DEFAULT_PORT = 5050
-DEFAULT_TOKEN = "offload-secret"
-CHUNK_SIZE = 1024 * 1024  # 1 MiB data frames
-MAX_JSON_BYTES = 4 * 1024 * 1024
-MAX_DATA_BYTES = 16 * 1024 * 1024
-
-FRAME_JSON = b"J"
-FRAME_DATA = b"D"
-_HEADER = struct.Struct("!cI")
+HEADER = struct.Struct(">IB")          # payload length (uint32) + message type (uint8)
+HEADER_SIZE = HEADER.size              # 5 bytes
+MAX_PAYLOAD = 16 * 1024 * 1024         # hard cap: 16 MiB per frame (guards memory)
+DEFAULT_CHUNK_SIZE = 1024 * 1024       # 1 MiB bulk chunks
+HASH_BLOCK = 1024 * 1024
 
 
-# --------------------------------------------------------------------------- errors
 class ProtocolError(Exception):
-    """Malformed or unexpected data on the wire."""
+    """Raised when the peer violates the framing/JSON contract."""
 
 
-class ConnectionClosed(ProtocolError):
-    """The peer closed the TCP connection."""
+class MsgType(enum.IntEnum):
+    """Message identifiers used on the wire."""
+
+    # --- handshake / discovery (Task 1) ---------------------------------- #
+    HELLO = 1              # C -> S  initial handshake
+    HELLO_ACK = 2          # S -> C  handshake acceptance + worker info
+    PING = 3               # C -> S  latency probe
+    PONG = 4               # S -> C  latency reply
+
+    # --- job submission & input transfer --------------------------------- #
+    JOB_SUBMIT = 10        # C -> S  job description (metadata only)
+    JOB_ACCEPTED = 11      # S -> C  job id assigned / queued
+    JOB_REJECTED = 12      # S -> C  validation failure
+    FILE_BEGIN = 13        # C -> S  transfer start (size, sha256)
+    FILE_CHUNK = 14        # C -> S  raw bytes
+    FILE_END = 15          # C -> S  transfer finished (sha256)
+    FILE_ACK = 16          # S -> C  checksum / size validation result
+
+    # --- execution feedback (Task 4) ------------------------------------- #
+    PROGRESS = 20          # S -> C  asynchronous percentage stream
+    LOG = 21               # S -> C  structured log line
+    HEARTBEAT = 22         # S -> C  keep-alive while queued/running
+
+    # --- job lifecycle ---------------------------------------------------- #
+    JOB_DONE = 30          # S -> C  execution finished successfully
+    JOB_FAILED = 31        # S -> C  execution failed
+    JOB_CANCEL = 32        # C -> S  request cancellation
+
+    # --- output download -------------------------------------------------- #
+    OUTPUT_REQUEST = 40    # C -> S  ask for the rendered artefact
+    OUTPUT_BEGIN = 41      # S -> C  output metadata (size, sha256)
+    OUTPUT_CHUNK = 42      # S -> C  raw bytes
+    OUTPUT_END = 43        # S -> C  transfer finished
+    OUTPUT_ACK = 44        # C -> S  checksum validation result
+
+    # --- misc ------------------------------------------------------------- #
+    ERROR = 90             # either direction, fatal protocol/runtime error
 
 
-class BusyError(ProtocolError):
-    """The worker is temporarily busy with this job (retryable)."""
+class MessageTypeError(ProtocolError):
+    pass
 
 
-class ChecksumError(ProtocolError):
-    """SHA-256 mismatch after a transfer (retryable, restarts the transfer)."""
+# --------------------------------------------------------------------------- #
+# Send / receive primitives
+# --------------------------------------------------------------------------- #
+
+def send_frame(sock: socket.socket, msg_type: int, payload: bytes = b"") -> None:
+    """Send one framed message. Raises on socket errors / oversize payloads."""
+    if len(payload) > MAX_PAYLOAD:
+        raise ProtocolError(f"payload too large: {len(payload)} > {MAX_PAYLOAD}")
+    sock.sendall(HEADER.pack(len(payload), int(msg_type)) + payload)
 
 
-class AuthError(ProtocolError):
-    """Token / protocol version rejected by the worker."""
+def send_json(sock: socket.socket, msg_type: int, obj: Any) -> None:
+    """Send a control message (JSON payload)."""
+    send_frame(sock, msg_type, json.dumps(obj, separators=(",", ":")).encode("utf-8"))
 
 
-class RemoteError(ProtocolError):
-    """The worker answered with an ERROR message."""
+def recv_exact(sock: socket.socket, n: int) -> bytes:
+    """Read exactly ``n`` bytes or raise ConnectionError/TimeoutError."""
+    chunks = []
+    remaining = n
+    while remaining > 0:
+        chunk = sock.recv(min(remaining, 1 << 20))
+        if not chunk:
+            raise ConnectionError("peer closed the connection while receiving")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
 
-    def __init__(self, code: str, message: str):
-        super().__init__(f"[{code}] {message}")
-        self.code = code
-        self.message = message
+
+def recv_frame(sock: socket.socket) -> Tuple[int, bytes]:
+    """Receive one framed message, returning ``(msg_type, payload)``."""
+    header = recv_exact(sock, HEADER_SIZE)
+    length, msg_type = HEADER.unpack(header)
+    if length > MAX_PAYLOAD:
+        raise ProtocolError(f"peer announced illegal frame length {length}")
+    payload = recv_exact(sock, length) if length else b""
+    return int(msg_type), payload
 
 
-class Cancelled(Exception):
-    """The user cancelled the operation."""
+def recv_json(sock: socket.socket, expect: Optional[int] = None) -> Tuple[int, dict]:
+    """Receive a control message and decode its JSON payload."""
+    msg_type, payload = recv_frame(sock)
+    if expect is not None and msg_type != expect:
+        raise MessageTypeError(f"expected {MsgType(expect).name}, got {MsgType(msg_type).name if msg_type in MsgType._value2member_map_ else msg_type}")
+    try:
+        obj = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ProtocolError(f"malformed JSON payload: {exc}") from exc
+    if not isinstance(obj, dict):
+        raise ProtocolError("control payload must be a JSON object")
+    return msg_type, obj
 
 
-# --------------------------------------------------------------------------- sockets
-def tune_socket(sock: socket.socket) -> None:
-    """Low-latency + large buffers; best effort."""
-    for level, opt, val in (
-        (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),
-        (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
-        (socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024),
-        (socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024),
-    ):
+def try_recv_json(sock: socket.socket) -> Tuple[int, dict]:
+    """Non-strict variant: decode whatever control message arrives."""
+    return recv_json(sock, expect=None)
+
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+
+def sha256_file(path: str) -> str:
+    """Streaming SHA-256 of a file (constant memory)."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(HASH_BLOCK), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def now() -> float:
+    return time.time()
+
+
+def safe_filename(name: str) -> str:
+    """Strip directories and dangerous characters from an inbound filename."""
+    name = os.path.basename(name.replace("\\", "/"))
+    name = "".join(ch for ch in name if ch.isalnum() or ch in "._- ()[]")
+    return name[:180] or "input.bin"
+
+
+def set_socket_options(sock: socket.socket, *, tcp_nodelay: bool = True,
+                       keepalive: bool = True) -> None:
+    if tcp_nodelay:
         try:
-            sock.setsockopt(level, opt, val)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+    if keepalive:
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         except OSError:
             pass
 
 
-def recv_exact(sock: socket.socket, n: int) -> bytearray:
-    buf = bytearray(n)
-    view = memoryview(buf)
-    got = 0
-    while got < n:
-        r = sock.recv_into(view[got:], n - got)
-        if r == 0:
-            raise ConnectionClosed("peer closed the connection")
-        got += r
-    return buf
-
-
-def send_json(sock: socket.socket, obj: dict) -> None:
-    payload = json.dumps(obj, separators=(",", ":")).encode("utf-8")
-    sock.sendall(_HEADER.pack(FRAME_JSON, len(payload)) + payload)
-
-
-def send_data(sock: socket.socket, data: bytes) -> None:
-    sock.sendall(_HEADER.pack(FRAME_DATA, len(data)))
-    sock.sendall(data)
-
-
-def recv_frame(sock: socket.socket) -> tuple[bytes, bytearray]:
-    kind, length = _HEADER.unpack(recv_exact(sock, _HEADER.size))
-    if kind == FRAME_JSON and length > MAX_JSON_BYTES:
-        raise ProtocolError(f"JSON frame too large ({length} bytes)")
-    if kind == FRAME_DATA and length > MAX_DATA_BYTES:
-        raise ProtocolError(f"data frame too large ({length} bytes)")
-    if kind not in (FRAME_JSON, FRAME_DATA):
-        raise ProtocolError(f"unknown frame type {kind!r}")
-    return kind, recv_exact(sock, length) if length else bytearray()
-
-
-def recv_json(sock: socket.socket) -> dict:
-    kind, payload = recv_frame(sock)
-    if kind != FRAME_JSON:
-        raise ProtocolError("expected a control message, got a data frame")
-    try:
-        msg = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ProtocolError(f"invalid JSON frame: {exc}") from exc
-    if not isinstance(msg, dict):
-        raise ProtocolError("control message must be a JSON object")
-    return msg
-
-
-def expect(sock: socket.socket, *types: str) -> dict:
-    """Receive one control message; raise on ERROR or an unexpected type."""
-    msg = recv_json(sock)
-    mtype = msg.get("type")
-    if mtype == "ERROR":
-        code = msg.get("code", "error")
-        if code == "busy":
-            raise BusyError(msg.get("message", "worker busy"))
-        if code in ("auth", "version"):
-            raise AuthError(msg.get("message", code))
-        raise RemoteError(code, msg.get("message", ""))
-    if types and mtype not in types:
-        raise ProtocolError(f"expected {'/'.join(types)}, got {mtype!r}")
-    return msg
-
-
-def send_error(sock: socket.socket, code: str, message: str) -> None:
-    try:
-        send_json(sock, {"type": "ERROR", "code": code, "message": message})
-    except OSError:
-        pass
-
-
-# --------------------------------------------------------------------------- file transfer
-def send_file_range(
-    sock: socket.socket,
-    path: str,
-    offset: int,
-    total: int,
-    progress_cb: Optional[Callable[[int], None]] = None,
-    cancel_check: Optional[Callable[[], bool]] = None,
-) -> int:
-    """Send bytes [offset, total) of *path* as data frames. Returns bytes sent."""
-    sent = offset
-    with open(path, "rb") as fh:
-        fh.seek(offset)
-        while sent < total:
-            if cancel_check and cancel_check():
-                raise Cancelled()
-            chunk = fh.read(min(CHUNK_SIZE, total - sent))
-            if not chunk:
-                raise ProtocolError("file is shorter than its declared size")
-            send_data(sock, chunk)
-            sent += len(chunk)
-            if progress_cb:
-                progress_cb(sent)
-    return sent - offset
-
-
-def recv_file_range(
-    sock: socket.socket,
-    sink,
-    expected: int,
-    progress_cb: Optional[Callable[[int], None]] = None,
-    cancel_check: Optional[Callable[[], bool]] = None,
-) -> int:
-    """Receive exactly *expected* bytes of data frames and write them to *sink*."""
-    got = 0
-    while got < expected:
-        if cancel_check and cancel_check():
-            raise Cancelled()
-        kind, payload = recv_frame(sock)
-        if kind == FRAME_JSON:
-            msg = json.loads(payload.decode("utf-8"))
-            if msg.get("type") == "ERROR":
-                raise RemoteError(msg.get("code", "error"), msg.get("message", ""))
-            raise ProtocolError(f"unexpected control message during transfer: {msg.get('type')}")
-        got += len(payload)
-        if got > expected:
-            raise ProtocolError("peer sent more data than announced")
-        sink.write(payload)
-        if progress_cb:
-            progress_cb(got)
-    return got
-
-
-class NullSink:
-    """File-like object that discards data (bandwidth tests)."""
-
-    def write(self, data) -> int:  # noqa: D401
-        return len(data)
-
-
-# --------------------------------------------------------------------------- integrity / auth
-def sha256_file(path: str, progress_cb: Optional[Callable[[int], None]] = None) -> str:
-    h = hashlib.sha256()
-    done = 0
-    with open(path, "rb") as fh:
-        while True:
-            block = fh.read(4 * 1024 * 1024)
-            if not block:
-                break
-            h.update(block)
-            done += len(block)
-            if progress_cb:
-                progress_cb(done)
-    return h.hexdigest()
-
-
-def make_nonce() -> str:
-    return os.urandom(16).hex()
-
-
-def auth_response(token: str, nonce: str) -> str:
-    return hmac.new(token.encode("utf-8"), nonce.encode("utf-8"), hashlib.sha256).hexdigest()
-
-
-def verify_auth(token: str, nonce: str, response: str) -> bool:
-    return hmac.compare_digest(auth_response(token, nonce), str(response))
+def human_bytes(n: float) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(n) < 1024.0:
+            return f"{n:3.1f} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} PiB"
