@@ -321,47 +321,32 @@ For a direct peer-to-peer Ethernet connection between the client laptop and serv
 
 ### 🎬 Animated End-to-End System Execution (Live Demo)
 > Below is the authentic animated demonstration showing real-time client-server communication, handshaking, asset upload, live progress percentage streaming, remote transcode execution, download, and SHA-256 cryptographic verification:
-> 
-> 📹 **High-Definition Video Available**: [Download / View demo.mp4]((https://drive.google.com/file/d/1A5XBLHQpV4vSa3wQgiviqFHVIrSpCX11/view?usp=sharing))
+
+## 📹 Project Demo
+
+🎬 **High-Definition Video Demo**
+
+[▶️ Watch / Download Project Demo](https://drive.google.com/file/d/1A5XBLHQpV4vSa3wQgiviqFHVIrSpCX11/view?usp=sharing)
+
+---
+
+## 🖥️ System Screenshots
+
+### Server Side
+![Server Side](https://github.com/user-attachments/assets/221c9e72-162a-41f4-8ffa-3898df811bd6)
+
+### Client Side
+![Client Side](https://github.com/user-attachments/assets/65906c37-414a-4028-b59b-f5907dda05aa)
+
+---
+
+## 🎞️ Live System Demo
 
 ![Live System Demo](./ss/demo.gif)
 
 ---
 
-### 🚀 Client GUI: Initial Launch & Workload Configuration (Evidence of Task 3)
-> Demonstrates the CustomTkinter dark-mode desktop GUI interface with network connection fields, worker status card, render configuration selectors, and integrated log terminal:
 
-![Client GUI Initial](./ss/client_gui_initial.PNG)
-
----
-
-### ⚡ Client GUI: Initial Handshake & Latency Ping Check (Evidence of Task 1)
-> Displays successful peer-to-peer connection, initial RTT latency probe (0.28 ms), connected worker hostname (`DESKTOP-QI6H2EA`), and remote hardware specifications discovery:
-
-![Client Handshake and Ping](./ss/client_gui_handshake.PNG)
-
----
-
-### 🖥️ Client GUI: Active Remote Progress Streaming (Evidence of Task 4)
-> Shows real-time percentage updates, current FPS, speed multiplier, and ETA calculation during live remote GPU/CPU execution:
-
-![Real-Time Progress Streaming](./ss/client_gui_progress.PNG)
-
----
-
-### ✅ Client GUI: Task Completion & Cryptographic SHA-256 Verification
-> Demonstrates completed job turnaround, time metrics breakdown, and green **"SHA-256: VERIFIED ✔"** badge confirming 100% data integrity with matching client-server checksums:
-
-![Completed Offload and SHA-256 Verified](./ss/client_gui_completed.PNG)
-
----
-
-### 🛡️ Remote Worker Node Daemon Execution Trace (Evidence of Task 2)
-> Terminal log of the remote worker daemon actively listening on port 5000, accepting client handshake, receiving streamed asset chunks, executing transcoding, and streaming progress:
-
-![Server Terminal Execution](./ss/server_terminal_execution.PNG)
-
----
 
 
 
