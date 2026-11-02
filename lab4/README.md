@@ -14,12 +14,8 @@
 
 | Field | Submission Details |
 | :--- | :--- |
-| **Student Full Name** | **Muhammad Ahmad Mujtaba** |
-| **Registration Number** | **FA23-BSE-041** |
-| **Degree Program** | Bachelor of Science in Software Engineering (BSE 7A) |
-| **Course Code & Title** | **CSC-334: Parallel and Distributed Computing** |
-| **Required Collaborator** | Invited `githubprojectmin@gmail.com` as collaborator |
-| **Repository Visibility** | **PUBLIC** |
+| **Student Full Name** | **Muhammad Abdul Rehman** |
+| **Registration Number** | **FA23-BSE-068** |
 
 ---
 
@@ -374,13 +370,7 @@ For a direct peer-to-peer Ethernet connection between the client laptop and serv
 
 ---
 
-## 👥 GitHub Submission & Collaborator Notice
 
-As mandated by the assignment guidelines:
-- **Repository Visibility**: PUBLIC
-- **Collaborator Account Added**: `githubprojectmin@gmail.com`
-- **Student Registration Number**: `FA23-BSE-041`
-- **Student Name**: Muhammad Ahmad Mujtaba
 
 ---
 <p align="center">
