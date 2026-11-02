@@ -370,13 +370,7 @@ For a direct peer-to-peer Ethernet connection between the client laptop and serv
 
 ---
 
-## 👥 GitHub Submission & Collaborator Notice
 
-As mandated by the assignment guidelines:
-- **Repository Visibility**: PUBLIC
-- **Collaborator Account Added**: `githubprojectmin@gmail.com`
-- **Student Registration Number**: `FA23-BSE-041`
-- **Student Name**: Muhammad Ahmad Mujtaba
 
 ---
 <p align="center">
