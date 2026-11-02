@@ -1,12 +1,5 @@
 # 🚀 CSC-334: Custom Distributed Task Offloading & Remote GPU Rendering System (Lab 04)
 
-<p align="center">
-  <img src="https://img.shields.io/badge/Course-CSC--334%20Parallel%20%26%20Distributed%20Computing-blue?style=for-the-badge&logo=codeforces" alt="Course Badge"/>
-  <img src="https://img.shields.io/badge/Total%20Marks-100%2F100-brightgreen?style=for-the-badge" alt="Marks Badge"/>
-  <img src="https://img.shields.io/badge/GPU%20Acceleration-NVIDIA%20NVENC%20%2F%20CUDA-76B900?style=for-the-badge&logo=nvidia" alt="Nvidia Badge"/>
-  <img src="https://img.shields.io/badge/Client%20GUI-CustomTkinter%20v6.0-purple?style=for-the-badge" alt="GUI Badge"/>
-  <img src="https://img.shields.io/badge/Integrity-SHA--256%20Checksums-orange?style=for-the-badge" alt="Security Badge"/>
-</p>
 
 ---
 
@@ -329,7 +322,7 @@ For a direct peer-to-peer Ethernet connection between the client laptop and serv
 ### 🎬 Animated End-to-End System Execution (Live Demo)
 > Below is the authentic animated demonstration showing real-time client-server communication, handshaking, asset upload, live progress percentage streaming, remote transcode execution, download, and SHA-256 cryptographic verification:
 > 
-> 📹 **High-Definition Video Available**: [Download / View demo.mp4](./ss/demo.mp4)
+> 📹 **High-Definition Video Available**: [Download / View demo.mp4]((https://drive.google.com/file/d/1A5XBLHQpV4vSa3wQgiviqFHVIrSpCX11/view?usp=sharing))
 
 ![Live System Demo](./ss/demo.gif)
 
